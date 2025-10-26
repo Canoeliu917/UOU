@@ -1,0 +1,972 @@
+import pygame
+import sys
+import random
+import math
+import time
+from pygame import gfxdraw
+
+# 初始化pygame
+pygame.init()
+pygame.mixer.init()
+
+# 屏幕设置（逻辑画面 800x600，窗口按比例缩放渲染）
+WIDTH, HEIGHT = 800, 600
+SCREEN_SCALE = 1.3  # 将画面缩小一倍（相对逻辑分辨率）
+window = pygame.display.set_mode((int(WIDTH * SCREEN_SCALE), int(HEIGHT * SCREEN_SCALE)))
+screen = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+pygame.display.set_caption("Bouncy Brick Breaker")
+
+# 颜色定义
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (255, 50, 50)
+GREEN = (50, 255, 50)
+BLUE = (50, 150, 255)
+YELLOW = (255, 255, 50)
+ORANGE = (255, 150, 50)
+PURPLE = (180, 50, 230)
+CYAN = (50, 255, 255)
+PINK = (255, 100, 180)
+LIGHT_BLUE = (100, 200, 255)
+DARK_BLUE = (20, 30, 70)
+GRAY = (150, 150, 150)
+FIREBRICK = (178, 34, 34)
+
+# 游戏参数
+clock = pygame.time.Clock()
+FPS = 120
+
+# 预构建空间背景（渐变 + 星点），避免每帧重绘带来的开销
+def build_space_bg():
+    bg = pygame.Surface((WIDTH, HEIGHT))
+    # 渐变
+    for y in range(HEIGHT):
+        color_value = int(255 * (1 - y / HEIGHT * 0.7))
+        pygame.draw.line(bg, (color_value//4, color_value//4, color_value//2), (0, y), (WIDTH, y))
+    # 星星
+    for i in range(100):
+        x = (i * 123) % WIDTH
+        y = (i * 67) % HEIGHT
+        brightness = (i * 13) % 155 + 100
+        size = (i % 3) + 1
+        pygame.draw.circle(bg, (brightness, brightness, brightness), (x, y), size)
+    return bg
+
+# Western-style text rendering (outline + bold look)
+def draw_western_text(surface, text, size, pos, color=WHITE, center=False,
+                      outline_color=BLACK, outline=2,
+                      font_candidates=("rockwell", "stencil", "impact", "arial black", "arial")):
+    try:
+        # Pick the first available-ish font name
+        for name in font_candidates:
+            font = pygame.font.SysFont(name, size, bold=True)
+            if font:  # pygame returns a font regardless; proceed with first
+                break
+    except Exception:
+        font = pygame.font.SysFont(None, size, bold=True)
+
+    # Render fill and outline
+    text_surf = font.render(text, True, color)
+    text_outline = font.render(text, True, outline_color)
+
+    rect = text_surf.get_rect()
+    if center:
+        rect.center = pos
+    else:
+        rect.topleft = pos
+
+    # Draw outline in 8 directions
+    for dx, dy in [(-outline, 0), (outline, 0), (0, -outline), (0, outline),
+                   (-outline, -outline), (outline, -outline), (-outline, outline), (outline, outline)]:
+        surface.blit(text_outline, (rect.x + dx, rect.y + dy))
+
+    # Draw main text
+    surface.blit(text_surf, rect)
+
+# 创建简单的音效
+def create_beep_sound(frequency=440, duration=100):
+    sample_rate = 44100
+    n_samples = int(round(duration * 0.001 * sample_rate))
+    buf = numpy.zeros((n_samples, 2), dtype=numpy.int16)
+    max_sample = 2**(16 - 1) - 1
+    for s in range(n_samples):
+        t = float(s) / sample_rate
+        buf[s][0] = int(round(max_sample * math.sin(2 * math.pi * frequency * t)))
+        buf[s][1] = int(round(max_sample * math.sin(2 * math.pi * frequency * t)))
+    return pygame.sndarray.make_sound(buf)
+
+# 更清脆的破碎音效（短促高频+衰减包络）
+def create_crisp_break_sound(duration=90):
+    sample_rate = 44100
+    n_samples = int(round(duration * 0.001 * sample_rate))
+    buf = numpy.zeros((n_samples, 2), dtype=numpy.int16)
+    max_sample = 2**(16 - 1) - 1
+    for s in range(n_samples):
+        t = float(s) / sample_rate
+        # 两个高频叠加 + 指数衰减
+        env = math.exp(-t * 25)
+        sig = (0.6 * math.sin(2 * math.pi * 1400 * t) +
+               0.4 * math.sin(2 * math.pi * 2100 * t)) * env
+        val = int(round(max_sample * sig))
+        buf[s][0] = val
+        buf[s][1] = val
+    return pygame.sndarray.make_sound(buf)
+
+# 更悦耳的拾取音效（叠加和声音色，柔和包络）
+def create_pickup_chime(duration=150):
+    sample_rate = 44100
+    n_samples = int(round(duration * 0.001 * sample_rate))
+    buf = numpy.zeros((n_samples, 2), dtype=numpy.int16)
+    max_sample = 2**(16 - 1) - 1
+    # 频率：A5 880Hz + E6 1319Hz + A6 1760Hz，带轻微立体声差异
+    f1, f2, f3 = 880.0, 1319.0, 1760.0
+    for s in range(n_samples):
+        t = float(s) / sample_rate
+        attack = min(1.0, t * 40)
+        env = attack * math.exp(-t * 6.0)
+        sig = (0.55 * math.sin(2 * math.pi * f1 * t) +
+               0.30 * math.sin(2 * math.pi * f2 * t) +
+               0.20 * math.sin(2 * math.pi * f3 * t)) * env
+        val = int(round(max_sample * sig))
+        buf[s][0] = val
+        buf[s][1] = int(val * 0.96)
+    return pygame.sndarray.make_sound(buf)
+
+try:
+    import numpy
+    # 碰撞/击中/掉落/升级/破碎 的基础提示音
+    bounce_sound = create_beep_sound(523, 50)       # C5，球碰撞墙/挡板
+    brick_sound = create_beep_sound(659, 50)        # E5，击中砖块
+    brick_break_sound = create_crisp_break_sound(85) # 更清脆的破碎音
+    power_sound = create_pickup_chime(150)          # 更悦耳的拾取提示音
+    game_over_sound = create_beep_sound(220, 500)   # A3，游戏结束
+    level_up_sound = create_beep_sound(1047, 200)   # C6，过关
+except:
+    # 如果numpy不可用，创建空的音效对象（静音回退）
+    bounce_sound = pygame.mixer.Sound(buffer=bytearray())
+    brick_sound = pygame.mixer.Sound(buffer=bytearray())
+    brick_break_sound = pygame.mixer.Sound(buffer=bytearray())
+    power_sound = pygame.mixer.Sound(buffer=bytearray())
+    game_over_sound = pygame.mixer.Sound(buffer=bytearray())
+    level_up_sound = pygame.mixer.Sound(buffer=bytearray())
+
+# 调整音量，确保区分度
+try:
+    bounce_sound.set_volume(0.35)
+    brick_sound.set_volume(0.45)
+    brick_break_sound.set_volume(0.6)
+    power_sound.set_volume(0.5)
+    game_over_sound.set_volume(0.6)
+    level_up_sound.set_volume(0.55)
+except Exception:
+    pass
+
+# 粒子效果类
+class Particle:
+    def __init__(self, x, y, color):
+        self.x = x
+        self.y = y
+        self.color = color
+        self.size = random.randint(2, 6)
+        self.speed_x = random.uniform(-4, 4)
+        self.speed_y = random.uniform(-4, 4)
+        self.life = random.randint(20, 40)
+        self.gravity = 0.1
+       
+    def update(self):
+        self.x += self.speed_x
+        self.y += self.speed_y
+        self.speed_y += self.gravity
+        self.life -= 1
+        self.size = max(0, self.size - 0.1)
+        return self.life <= 0
+       
+    def draw(self, surface):
+        alpha = min(255, self.life * 6)
+        color_with_alpha = (*self.color, alpha)
+        gfxdraw.filled_circle(surface, int(self.x), int(self.y), int(self.size), color_with_alpha)
+
+# 挡板类
+class Paddle:
+    def __init__(self):
+        self.width = 120
+        self.height = 20
+        self.x = WIDTH // 2 - self.width // 2
+        self.y = HEIGHT - 50
+        self.speed = 10
+        self.color = BLUE
+        self.power_timer = 0
+        self.power_type = None
+        self.glow_effect = 0
+        self.glow_direction = 1
+        self.sticky = False
+       
+    def draw(self):
+        # 绘制发光效果
+        if self.power_timer > 0:
+            self.glow_effect += 0.1 * self.glow_direction
+            if self.glow_effect > 1 or self.glow_effect < 0:
+                self.glow_direction *= -1
+           
+            glow_color = (
+                min(255, self.color[0] + int(50 * self.glow_effect)),
+                min(255, self.color[1] + int(50 * self.glow_effect)),
+                min(255, self.color[2] + int(50 * self.glow_effect))
+            )
+        else:
+            glow_color = self.color
+           
+        # 绘制挡板主体
+        pygame.draw.rect(screen, glow_color, (self.x, self.y, self.width, self.height), border_radius=10)
+       
+        # 绘制挡板边缘高光
+        pygame.draw.rect(screen, WHITE, (self.x, self.y, self.width, 4), border_radius=10)
+       
+        # 绘制粘性挡板的特效
+        if self.sticky:
+            for i in range(5):
+                dot_x = self.x + (i+1) * self.width // 6
+                pygame.draw.circle(screen, YELLOW, (dot_x, self.y + self.height//2), 3)
+       
+    def move(self, direction):
+        if direction == "left" and self.x > 0:
+            self.x -= self.speed
+        if direction == "right" and self.x < WIDTH - self.width:
+            self.x += self.speed
+           
+    def update_power(self):
+        if self.power_timer > 0:
+            self.power_timer -= 1
+            if self.power_timer == 0:
+                self.reset_power()
+               
+    def reset_power(self):
+        self.width = 120
+        self.speed = 10
+        self.color = BLUE
+        self.sticky = False
+        self.power_type = None
+       
+    def activate_power(self, power_type):
+        self.power_type = power_type
+        if power_type == "long_paddle":
+            self.width = 180
+            self.color = GREEN
+            self.power_timer = 600  # 10秒
+        elif power_type == "short_paddle":
+            self.width = 80
+            self.color = RED
+            self.power_timer = 300  # 5秒
+        elif power_type == "fast_paddle":
+            self.speed = 15
+            self.color = CYAN
+            self.power_timer = 450  # 7.5秒
+        elif power_type == "sticky_paddle":
+            self.sticky = True
+            self.color = YELLOW
+            self.power_timer = 450  # 7.5秒
+
+# 球类
+class Ball:
+    def __init__(self):
+        self.radius = 9
+        self.x = WIDTH // 2
+        self.y = HEIGHT // 2
+        # 降低出发速度
+        self.dx = random.choice([-3, -2, 2, 3])
+        self.dy = -3
+        self.color = RED
+        self.active = True
+        self.stuck = False
+        self.trail_particles = []
+        self.speed_multiplier = 1.0
+       
+    def draw(self):
+        # 绘制拖尾效果
+        for particle in self.trail_particles[:]:
+            if particle.update():
+                self.trail_particles.remove(particle)
+            else:
+                particle.draw(screen)
+       
+        # 绘制球体
+        gfxdraw.filled_circle(screen, int(self.x), int(self.y), self.radius, self.color)
+       
+        # 绘制球体高光
+        gfxdraw.filled_circle(screen, int(self.x - self.radius/3), int(self.y - self.radius/3), self.radius//3, WHITE)
+       
+        # 绘制粘性球的指示器
+        if self.stuck:
+            pygame.draw.circle(screen, YELLOW, (int(self.x), int(self.y)), self.radius + 3, 2)
+       
+    def move(self):
+        # 添加拖尾粒子
+        if random.random() < 0.7:
+            self.trail_particles.append(Particle(self.x, self.y, self.color))
+           
+        if not self.stuck:
+            self.x += self.dx * self.speed_multiplier
+            self.y += self.dy * self.speed_multiplier
+       
+        # 边界碰撞检测
+        if self.x <= self.radius or self.x >= WIDTH - self.radius:
+            self.dx = -self.dx
+            bounce_sound.play()
+        if self.y <= self.radius:
+            self.dy = -self.dy
+            bounce_sound.play()
+           
+        # 掉落检测
+        if self.y >= HEIGHT + self.radius:
+            self.active = False
+           
+    def collide_paddle(self, paddle):
+        if (self.y + self.radius >= paddle.y and
+            self.y - self.radius <= paddle.y + paddle.height and
+            self.x + self.radius >= paddle.x and
+            self.x - self.radius <= paddle.x + paddle.width):
+           
+            # 粘性挡板逻辑
+            if paddle.sticky and not self.stuck:
+                self.stuck = True
+                return True
+               
+            # 根据击中挡板的位置改变反弹角度
+            relative_intersect_x = (paddle.x + (paddle.width / 2)) - self.x
+            normalized_relative_intersect_x = relative_intersect_x / (paddle.width / 2)
+            bounce_angle = normalized_relative_intersect_x * (math.pi / 3)  # 最大60度角
+           
+            self.dx = -6 * math.sin(bounce_angle) * self.speed_multiplier
+            self.dy = -6 * math.cos(bounce_angle) * self.speed_multiplier
+           
+            bounce_sound.play()
+            return True
+        return False
+   
+    def release(self):
+        if self.stuck:
+            self.stuck = False
+            # 释放时也保持较低的初速度
+            self.dy = -3 * self.speed_multiplier
+
+# 砖块类
+class Brick:
+    def __init__(self, x, y, color, hits=1, special=False):
+        self.width = 25
+        self.height = 10
+        self.x = x
+        self.y = y
+        self.color = color
+        self.hits = hits
+        self.max_hits = hits
+        self.particles = []
+        self.special = special
+        self.pulse = 0
+        self.pulse_direction = 1
+       
+    def draw(self):
+        # 特殊砖块的脉冲效果
+        if self.special:
+            self.pulse += 0.05 * self.pulse_direction
+            if self.pulse > 1 or self.pulse < 0:
+                self.pulse_direction *= -1
+               
+            pulse_color = (
+                min(255, self.color[0] + int(50 * self.pulse)),
+                min(255, self.color[1] + int(50 * self.pulse)),
+                min(255, self.color[2] + int(50 * self.pulse))
+            )
+        else:
+            pulse_color = self.color
+           
+        # 根据剩余生命值调整颜色亮度
+        r, g, b = pulse_color
+        factor = 0.5 + (self.hits / self.max_hits) * 0.5
+        draw_color = (min(255, int(r * factor)), min(255, int(g * factor)), min(255, int(b * factor)))
+       
+        # 中空包围结构：只绘制边框（双线风格）
+        pygame.draw.rect(screen, draw_color, (self.x, self.y, self.width, self.height), 2, border_radius=3)
+        inner_color = (draw_color[0]//2, draw_color[1]//2, draw_color[2]//2)
+        if self.width > 8 and self.height > 8:
+            pygame.draw.rect(screen, inner_color, (self.x + 3, self.y + 3, self.width - 6, self.height - 6), 1, border_radius=2)
+       
+        # 绘制生命值指示器（适配更小砖块）
+        if self.max_hits > 1:
+            life_width = max(0, (self.width - 6) * (self.hits / self.max_hits))
+            life_color = GREEN if self.hits > self.max_hits/2 else YELLOW if self.hits > 1 else RED
+            pygame.draw.rect(screen, life_color, (self.x + 3, self.y + self.height - 3, life_width, 2), border_radius=1)
+           
+        # 绘制特殊砖块标识
+        if self.special:
+            pygame.draw.circle(screen, WHITE, (self.x + self.width//2, self.y + self.height//2), 3)
+           
+        # 绘制粒子效果
+        for particle in self.particles[:]:
+            if particle.update():
+                self.particles.remove(particle)
+            else:
+                particle.draw(screen)
+
+    def create_particles(self):
+        for _ in range(10):
+            self.particles.append(Particle(
+                self.x + random.randint(0, self.width),
+                self.y + random.randint(0, self.height),
+                self.color
+            ))
+       
+    def collide_ball(self, ball):
+        if (ball.y - ball.radius <= self.y + self.height and
+            ball.y + ball.radius >= self.y and
+            ball.x + ball.radius >= self.x and
+            ball.x - ball.radius <= self.x + self.width):
+
+            # 确定从哪边碰撞
+            dx1 = abs(ball.x - self.x)
+            dx2 = abs(ball.x - (self.x + self.width))
+            dy1 = abs(ball.y - self.y)
+            dy2 = abs(ball.y - (self.y + self.height))
+
+            min_dist = min(dx1, dx2, dy1, dy2)
+
+            if min_dist == dx1 or min_dist == dx2:
+                ball.dx = -ball.dx
+            else:
+                ball.dy = -ball.dy
+
+            self.hits -= 1
+            brick_sound.play()
+
+            # 创建粒子效果
+            self.create_particles()
+
+            return self.hits <= 0
+        return False
+
+# 道具类
+class PowerUp:
+    def __init__(self, x, y, power_type):
+        self.width = 30
+        self.height = 30
+        self.x = x
+        self.y = y
+        self.power_type = power_type
+        self.speed = 3
+        self.active = True
+        self.rotation = 0
+        self.glow_effect = 0
+        self.glow_direction = 1
+       
+        if power_type == "long_paddle":
+            self.color = GREEN
+        elif power_type == "short_paddle":
+            self.color = RED
+        elif power_type == "fast_paddle":
+            self.color = CYAN
+        elif power_type == "sticky_paddle":
+            self.color = YELLOW
+        elif power_type == "extra_ball":
+            self.color = ORANGE
+        elif power_type == "slow_ball":
+            self.color = PURPLE
+        elif power_type == "fast_ball":
+            self.color = PINK
+           
+    def draw(self):
+        # 更新发光效果
+        self.glow_effect += 0.1 * self.glow_direction
+        if self.glow_effect > 1 or self.glow_effect < 0:
+            self.glow_direction *= -1
+           
+        glow_color = (
+            min(255, self.color[0] + int(50 * self.glow_effect)),
+            min(255, self.color[1] + int(50 * self.glow_effect)),
+            min(255, self.color[2] + int(50 * self.glow_effect))
+        )
+       
+        # 绘制道具底座
+        pygame.draw.rect(screen, glow_color, (self.x, self.y, self.width, self.height), border_radius=8)
+       
+        # 绘制道具图标
+        if self.power_type == "long_paddle":
+            pygame.draw.rect(screen, WHITE, (self.x + 5, self.y + 12, self.width - 10, 6), border_radius=3)
+        elif self.power_type == "short_paddle":
+            pygame.draw.rect(screen, WHITE, (self.x + 10, self.y + 12, self.width - 20, 6), border_radius=3)
+        elif self.power_type == "fast_paddle":
+            pygame.draw.polygon(screen, WHITE, [(self.x + 10, self.y + 10),
+                                              (self.x + self.width - 10, self.y + self.height//2),
+                                              (self.x + 10, self.y + self.height - 10)])
+        elif self.power_type == "sticky_paddle":
+            pygame.draw.circle(screen, WHITE, (self.x + self.width//2, self.y + self.height//2), 8)
+            pygame.draw.circle(screen, self.color, (self.x + self.width//2, self.y + self.height//2), 5)
+        elif self.power_type == "extra_ball":
+            pygame.draw.circle(screen, WHITE, (self.x + self.width//2, self.y + self.height//2), 8)
+            pygame.draw.circle(screen, self.color, (self.x + self.width//2, self.y + self.height//2), 5)
+        elif self.power_type == "slow_ball":
+            pygame.draw.circle(screen, WHITE, (self.x + self.width//2, self.y + self.height//2), 8)
+            pygame.draw.line(screen, WHITE, (self.x + 8, self.y + self.height//2),
+                            (self.x + self.width - 8, self.y + self.height//2), 3)
+        elif self.power_type == "fast_ball":
+            pygame.draw.circle(screen, WHITE, (self.x + self.width//2, self.y + self.height//2), 8)
+            pygame.draw.line(screen, WHITE, (self.x + self.width//2, self.y + 8),
+                            (self.x + self.width//2, self.y + self.height - 8), 3)
+           
+        # 更新旋转
+        self.rotation = (self.rotation + 2) % 360
+           
+    def move(self):
+        self.y += self.speed
+        if self.y > HEIGHT:
+            self.active = False
+           
+    def collide_paddle(self, paddle):
+        if (self.y + self.height >= paddle.y and
+            self.y <= paddle.y + paddle.height and
+            self.x + self.width >= paddle.x and
+            self.x <= paddle.x + paddle.width):
+            power_sound.play()
+            return True
+        return False
+
+# 游戏类
+class Game:
+    def __init__(self):
+        self.paddle = Paddle()
+        self.balls = [Ball()]
+        self.bricks = []
+        self.power_ups = []
+        self.score = 0
+        self.lives = 3
+        self.level = 1
+        self.game_over = False
+        self.game_won = False
+        self.particles = []
+        self.combo = 0
+        self.combo_timer = 0
+        # 预渲染背景
+        self.bg = build_space_bg()
+        self.create_bricks()
+       
+    def create_bricks(self):
+        self.bricks = []
+        colors = [RED, GREEN, BLUE, YELLOW, ORANGE, PURPLE, CYAN, PINK]
+
+        # 增加砖块数量：行数从 6 增至 9，列维持 27（保证横向间距合理）
+        rows, cols = 9, 27
+        brick_w, brick_h = 25, 10
+        gap_x = max(1, (WIDTH - cols * brick_w) // (cols + 1))
+        start_x = gap_x
+        top_y = 60
+        area_h = 240
+        gap_y = max(6, (area_h - rows * brick_h) // (rows + 1))
+
+        # 增加更多简单图案：在原有基础上扩展
+        patterns = [
+            "full", "checker", "xshape", "border", "pyramid", "stripes",
+            "rows", "columns", "plus", "diamond", "hollow_diamond",
+            "zigzag", "center_box", "diagonal_half", "rings", "steps"
+        ]
+        pattern = random.choice(patterns)
+
+        center_r = rows // 2
+        center_c = cols // 2
+
+        def include_cell(r, c):
+            if pattern == "full":
+                return True
+            if pattern == "checker":
+                return ((r + c) % 2) == 0
+            if pattern == "xshape":
+                # 近似X形（矩形网格上两条斜线）
+                return (r == c) or ((r + c) == (rows - 1))
+            if pattern == "border":
+                return r in (0, rows - 1) or c in (0, cols - 1)
+            if pattern == "pyramid":
+                center = cols // 2
+                width = max(0, center - r)
+                return center - width <= c <= center + width
+            if pattern == "stripes":
+                # 斜向条纹感
+                return (c % 2) == (r % 2)
+            if pattern == "rows":
+                # 仅偶数行
+                return (r % 2) == 0
+            if pattern == "columns":
+                # 仅偶数列
+                return (c % 2) == 0
+            if pattern == "plus":
+                # 十字形
+                return r == center_r or c == center_c
+            if pattern == "diamond":
+                # 菱形（曼哈顿距离）
+                return abs(r - center_r) + abs(c - center_c) <= center_r
+            if pattern == "hollow_diamond":
+                d = abs(r - center_r) + abs(c - center_c)
+                return center_r - 1 <= d <= center_r + 1
+            if pattern == "zigzag":
+                # 之字形：列每4格换相位
+                phase = (c % 4) // 2
+                return ((r + phase) % 2) == 0
+            if pattern == "center_box":
+                # 中央矩形块
+                return abs(r - center_r) <= 2 and abs(c - center_c) <= 6
+            if pattern == "diagonal_half":
+                # 左上三角区域
+                return (r + c) <= (center_r + center_c)
+            if pattern == "rings":
+                # 外边框 + 内边框形成同心“环”
+                outer = r in (0, rows - 1) or c in (0, cols - 1)
+                inner = r in (2, rows - 3) or c in (2, cols - 3)
+                return outer or inner
+            if pattern == "steps":
+                # 楼梯状：每两行推进一列
+                return c <= center_c + (r // 2)
+            return True
+
+        count = 0
+        for row in range(rows):
+            for col in range(cols):
+                if not include_cell(row, col):
+                    continue
+                x = start_x + col * (brick_w + gap_x)
+                y = top_y + row * (brick_h + gap_y)
+                color = colors[(row * 2 + col) % len(colors)]
+                # 降低砖块生命值，更容易击碎
+                hits = 1
+                special = random.random() < 0.1
+                self.bricks.append(Brick(x, y, color, hits, special))
+                count += 1
+
+        # 过于稀疏则回退为满铺
+        if count < (rows * cols) // 3:
+            self.bricks = []
+            for row in range(rows):
+                for col in range(cols):
+                    x = start_x + col * (brick_w + gap_x)
+                    y = top_y + row * (brick_h + gap_y)
+                    color = colors[(row * 2 + col) % len(colors)]
+                    hits = 1
+                    special = random.random() < 0.1
+                    self.bricks.append(Brick(x, y, color, hits, special))
+               
+    def update(self):
+        # 更新挡板
+        self.paddle.update_power()
+       
+        # 更新连击计时器
+        if self.combo_timer > 0:
+            self.combo_timer -= 1
+        else:
+            self.combo = 0
+           
+        # 更新球
+        for ball in self.balls[:]:
+            ball.move()
+           
+            # 检测与挡板的碰撞
+            if ball.collide_paddle(self.paddle):
+                continue
+               
+            # 检测与砖块的碰撞
+            brick_hit = False
+            for brick in self.bricks[:]:
+                if brick.collide_ball(ball):
+                    self.score += 10 * brick.max_hits
+                    self.combo += 1
+                    self.combo_timer = 60  # 1秒内连击有效
+                   
+                    # 连击奖励
+                    if self.combo >= 5:
+                        self.score += self.combo * 5
+                   
+                    # 掉落道具仅限：增加小球数量(extra_ball) 和 延长挡板长度(long_paddle)
+                    # 特殊砖块必定掉落；普通砖块25%
+                    if brick.special or random.random() < 0.25:
+                        power_types = ["extra_ball", "long_paddle"]
+                        weights = [60, 40]
+                        power_type = random.choices(power_types, weights=weights)[0]
+                        self.power_ups.append(PowerUp(brick.x + brick.width//2, brick.y, power_type))
+                   
+                    if brick.hits <= 0:
+                        self.bricks.remove(brick)
+                    brick_hit = True
+                    break
+                   
+            # 检测球是否掉落
+            if not ball.active:
+                self.balls.remove(ball)
+                # 创建球消失的粒子效果
+                for _ in range(15):
+                    self.particles.append(Particle(ball.x, ball.y, ball.color))
+                self.combo = 0  # 重置连击
+               
+        # 如果没有活动的球，减少生命值并重置
+        if len(self.balls) == 0:
+            self.lives -= 1
+            if self.lives > 0:
+                self.balls = [Ball()]
+                self.paddle.reset_power()
+            else:
+                self.game_over = True
+                game_over_sound.play()
+               
+        # 更新道具
+        for power_up in self.power_ups[:]:
+            power_up.move()
+           
+            if power_up.collide_paddle(self.paddle):
+                if power_up.power_type == "long_paddle":
+                    self.paddle.activate_power("long_paddle")
+                elif power_up.power_type == "short_paddle":
+                    self.paddle.activate_power("short_paddle")
+                elif power_up.power_type == "fast_paddle":
+                    self.paddle.activate_power("fast_paddle")
+                elif power_up.power_type == "sticky_paddle":
+                    self.paddle.activate_power("sticky_paddle")
+                elif power_up.power_type == "extra_ball":
+                    # 添加一个新球
+                    new_ball = Ball()
+                    new_ball.x = self.paddle.x + self.paddle.width // 2
+                    new_ball.y = self.paddle.y - 20
+                    self.balls.append(new_ball)
+                elif power_up.power_type == "slow_ball":
+                    # 减慢所有球的速度
+                    for ball in self.balls:
+                        ball.speed_multiplier = 0.7
+                elif power_up.power_type == "fast_ball":
+                    # 加快所有球的速度
+                    for ball in self.balls:
+                        ball.speed_multiplier = 1.5
+                   
+                self.power_ups.remove(power_up)
+            elif not power_up.active:
+                self.power_ups.remove(power_up)
+               
+        # 更新粒子效果
+        for particle in self.particles[:]:
+            if particle.update():
+                self.particles.remove(particle)
+               
+        # 检查是否过关
+        if len(self.bricks) == 0:
+            self.level += 1
+            self.balls = [Ball()]
+            self.paddle.reset_power()
+            self.create_bricks()
+            level_up_sound.play()
+           
+            if self.level > 5:  # 5关
+                self.game_won = True
+               
+    def draw(self):
+        # 背景一次生成，逐帧复用
+        screen.blit(self.bg, (0, 0))
+       
+        # 绘制挡板
+        self.paddle.draw()
+       
+        # 绘制球
+        for ball in self.balls:
+            ball.draw()
+           
+        # 绘制砖块
+        for brick in self.bricks:
+            brick.draw()
+           
+        # 绘制道具
+        for power_up in self.power_ups:
+            power_up.draw()
+           
+        # 绘制粒子效果
+        for particle in self.particles:
+            particle.draw(screen)
+           
+        # 绘制UI背景
+        pygame.draw.rect(screen, (30, 30, 60, 180), (0, 0, WIDTH, 40))
+        pygame.draw.line(screen, CYAN, (0, 40), (WIDTH, 40), 2)
+
+        # 绘制分数和生命值（西部风格描边字体）
+        draw_western_text(screen, f"Level: {self.level}", 24, (20, 10), color=WHITE)
+        draw_western_text(screen, f"Score: {self.score}", 24, (WIDTH // 2, 10), color=WHITE, center=True)
+        lives_text = f"Lives: {self.lives}"
+        lw, _ = pygame.font.SysFont("arial", 24, bold=True).size(lives_text)
+        draw_western_text(screen, lives_text, 24, (WIDTH - lw - 20, 10), color=WHITE)
+
+        # 绘制连击
+        if self.combo >= 3:
+            draw_western_text(screen, f"{self.combo} Combo!", 28, (WIDTH // 2, HEIGHT - 40), color=YELLOW, center=True)
+       
+        # 绘制游戏结束或胜利信息
+        if self.game_over or self.game_won:
+            # 半透明覆盖层
+            overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 180))
+            screen.blit(overlay, (0, 0))
+           
+            if self.game_over:
+                draw_western_text(screen, "Game Over!", 72, (WIDTH//2, HEIGHT//2 - 80), color=FIREBRICK, center=True)
+            else:
+                draw_western_text(screen, "You Win!", 72, (WIDTH//2, HEIGHT//2 - 80), color=GREEN, center=True)
+            draw_western_text(screen, f"Final Score: {self.score}", 36, (WIDTH//2, HEIGHT//2), color=YELLOW, center=True)
+            draw_western_text(screen, "Press R to Restart or ESC for Menu", 24, (WIDTH//2, HEIGHT//2 + 60), color=WHITE, center=True)
+
+# 开始菜单类
+class StartMenu:
+    def __init__(self):
+        self.selected_option = 0
+        self.options = ["Start Game", "Continue", "Quit"]
+        self.title_font = pygame.font.SysFont("simhei", 72, bold=True)
+        self.option_font = pygame.font.SysFont("simhei", 36)
+        # 预渲染背景
+        self.bg = build_space_bg()
+        # 开场动画：翻滚并放大
+        self.intro_active = True
+        self.intro_progress = 0.0  # 0.0 -> 1.0
+        self.intro_duration = 1.8  # 秒
+        self.intro_angle = 0.0
+        # 预渲染一个带条纹的小球贴图，方便旋转缩放
+        base_size = 100
+        self.ball_base = pygame.Surface((base_size, base_size), pygame.SRCALPHA)
+        pygame.gfxdraw.filled_circle(self.ball_base, base_size//2, base_size//2, 40, RED)
+        pygame.gfxdraw.filled_circle(self.ball_base, base_size//2 - 13, base_size//2 - 13, 13, WHITE)
+        # 条纹（让旋转可见）
+        pygame.draw.rect(self.ball_base, WHITE, (base_size//2 - 3, base_size//2 - 40, 6, 80), border_radius=3)
+        # 菜单背景球动画（退化用，不在intro时使用）
+        self.ball_x = WIDTH // 2
+        self.ball_y = HEIGHT // 2
+        self.ball_dx = 5
+        self.ball_dy = 5
+       
+    def update(self):
+        if self.intro_active:
+            self.intro_progress = min(1.0, self.intro_progress + (1.0 / (self.intro_duration * FPS)))
+            self.intro_angle = (self.intro_angle + 6) % 360
+            # 自动结束
+            if self.intro_progress >= 1.0:
+                self.intro_active = False
+        else:
+            # 更新菜单中的球动画（作为背景点缀）
+            self.ball_x += self.ball_dx
+            self.ball_y += self.ball_dy
+            if self.ball_x <= 20 or self.ball_x >= WIDTH - 20:
+                self.ball_dx = -self.ball_dx
+            if self.ball_y <= 100 or self.ball_y >= HEIGHT - 20:
+                self.ball_dy = -self.ball_dy
+       
+    def draw(self):
+        # 背景一次生成，逐帧复用
+        screen.blit(self.bg, (0, 0))
+       
+        # 绘制开场动画或背景球
+        if self.intro_active:
+            # 放大比例：从0.3 -> 1.5，缓出
+            t = self.intro_progress
+            scale = 0.3 + (1.5 - 0.3) * (1 - (1 - t) * (1 - t))
+            ball_img = pygame.transform.rotozoom(self.ball_base, self.intro_angle, scale)
+            rect = ball_img.get_rect(center=(WIDTH//2, HEIGHT//2))
+            screen.blit(ball_img, rect)
+            tip_font = pygame.font.SysFont("simhei", 18)
+            tip = tip_font.render("Press any key to skip", True, GRAY)
+            screen.blit(tip, (WIDTH//2 - tip.get_width()//2, HEIGHT - 60))
+            # 开场期间不显示选项
+            return
+        else:
+            pygame.draw.circle(screen, RED, (int(self.ball_x), int(self.ball_y)), 15)
+            pygame.draw.circle(screen, WHITE, (int(self.ball_x - 5), int(self.ball_y - 5)), 5)
+       
+        # 绘制标题
+        draw_western_text(screen, "Bouncy Brick Breaker", 72, (WIDTH//2, 100), color=FIREBRICK, center=True)
+       
+        # 绘制选项
+        for i, option in enumerate(self.options):
+            color = YELLOW if i == self.selected_option else WHITE
+            draw_western_text(screen, option, 36, (WIDTH//2, 250 + i*60), color=color, center=True)
+        # 绘制操作提示
+        draw_western_text(screen, "Use ↑↓ to select, Enter to confirm", 18, (WIDTH//2, HEIGHT - 50), color=GRAY, center=True)
+       
+    def handle_input(self, event):
+        if event.type == pygame.KEYDOWN:
+            if self.intro_active:
+                # 任意键跳过开场动画
+                self.intro_active = False
+                return "menu"
+            if event.key == pygame.K_UP:
+                self.selected_option = (self.selected_option - 1) % len(self.options)
+            elif event.key == pygame.K_DOWN:
+                self.selected_option = (self.selected_option + 1) % len(self.options)
+            elif event.key == pygame.K_RETURN:
+                if self.selected_option == 0:
+                    return "start_game"
+                elif self.selected_option == 1:
+                    return "continue_game"
+                elif self.selected_option == 2:
+                    return "quit"
+        return "menu"
+
+# 主游戏循环
+def main():
+    game = None
+    menu = StartMenu()
+    current_screen = "menu"
+    running = True
+   
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+               
+            if current_screen == "menu":
+                result = menu.handle_input(event)
+                if result == "start_game":
+                    game = Game()
+                    current_screen = "game"
+                elif result == "continue_game":
+                    if game is not None and not game.game_over and not game.game_won:
+                        current_screen = "game"
+                    else:
+                        game = Game()
+                        current_screen = "game"
+                elif result == "quit":
+                    running = False
+            elif current_screen == "game":
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_r:
+                        # 随时按R重新开始游戏
+                        game = Game()
+                    if event.key == pygame.K_ESCAPE:
+                        # 按ESC返回主菜单/选择界面
+                        current_screen = "menu"
+                    if event.key == pygame.K_SPACE:
+                        # 释放粘在挡板上的球
+                        for ball in game.balls:
+                            ball.release()
+                   
+        # 获取按键状态
+        keys = pygame.key.get_pressed()
+        if current_screen == "game" and not game.game_over and not game.game_won:
+            if keys[pygame.K_LEFT]:
+                game.paddle.move("left")
+            if keys[pygame.K_RIGHT]:
+                game.paddle.move("right")
+           
+            # 更新游戏状态
+            game.update()
+        elif current_screen == "menu":
+            menu.update()
+           
+        # 绘制当前屏幕
+        if current_screen == "menu":
+            menu.draw()
+        elif current_screen == "game":
+            game.draw()
+
+        # 将逻辑画面按比例缩放到窗口并显示
+        pygame.transform.smoothscale(screen, (int(WIDTH * SCREEN_SCALE), int(HEIGHT * SCREEN_SCALE)), window)
+        pygame.display.flip()
+        clock.tick(FPS)
+       
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
